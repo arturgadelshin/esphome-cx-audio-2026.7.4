@@ -9,6 +9,8 @@
 
 #include "esphome/components/audio/audio_transfer_buffer.h"
 
+#include <esp_memory_utils.h>
+
 #ifdef USE_OTA
 #include "esphome/components/ota/ota_backend.h"
 #endif
@@ -21,16 +23,22 @@ static const ssize_t DETECTION_QUEUE_LENGTH = 5;
 
 static const size_t DATA_TIMEOUT_MS = 50;
 
-static const uint32_t RING_BUFFER_DURATION_MS = 120;
+// 1000 ms (upstream: 120 ms) gives the inference task extra headroom when the
+// main loop is busy; matches the tuning used by the cx22721/cx20921 fork.
+static const uint32_t RING_BUFFER_DURATION_MS = 1000;
 
 #ifdef CONFIG_IDF_TARGET_ESP32P4
 // ESP32-P4 PIE-optimized esp-nn kernels (e.g. depthwise_conv_s8_ch1_pie) require
 // significantly more stack than other variants, causing stack protection faults at 3072.
 static const uint32_t INFERENCE_TASK_STACK_SIZE = 8192;
 #else
-static const uint32_t INFERENCE_TASK_STACK_SIZE = 3072;
+// 5120 (upstream: 3072) leaves room for the higher task priority below; the
+// cx_mic_task feeding the ring buffer runs at priority 5.
+static const uint32_t INFERENCE_TASK_STACK_SIZE = 5120;
 #endif
-static const UBaseType_t INFERENCE_TASK_PRIORITY = 3;
+// 6 (upstream: 3) keeps inference ahead of the microphone task (priority 5)
+// so the ring buffer is drained before it overflows.
+static const UBaseType_t INFERENCE_TASK_PRIORITY = 6;
 
 enum EventGroupBits : uint32_t {
   COMMAND_STOP = (1 << 0),               // Signals the inference task should stop
@@ -317,7 +325,8 @@ void MicroWakeWord::loop() {
         }
 
         if (!this->inference_task_.create(MicroWakeWord::inference_task, "mww", INFERENCE_TASK_STACK_SIZE,
-                                          (void *) this, INFERENCE_TASK_PRIORITY, this->task_stack_in_psram_)) {
+                                          (void *) this, INFERENCE_TASK_PRIORITY, this->task_stack_in_psram_,
+                                          /*core_id=*/1)) {
           FrontendFreeStateContents(&this->frontend_state_);  // Deallocate frontend state
           this->status_momentary_error("task_start", 1000);
         }
@@ -362,7 +371,10 @@ void MicroWakeWord::start() {
   }
 
   if (this->is_running()) {
-    ESP_LOGW(TAG, "Wake word detection is already running");
+    // Already detecting: mark for a restart instead of just warning, so a
+    // quick stop/start cycle (e.g. voice assistant on_end) isn't dropped.
+    ESP_LOGD(TAG, "Wake word detection is already running, marking for restart");
+    this->pending_start_ = true;
     return;
   }
 
@@ -393,6 +405,21 @@ void MicroWakeWord::set_state_(State state) {
 bool MicroWakeWord::generate_features_(const int16_t *audio_buffer, size_t samples_available,
                                        int8_t features_buffer[PREPROCESSOR_FEATURE_SIZE], size_t *processed_samples) {
   *processed_samples = 0;
+  // Canary against external memory corruption: the FFT working buffers live in
+  // PSRAM (see FftPopulateState). Crashes inside kiss_fft were traced to
+  // buffer pointers being overwritten with code addresses. Valid data buffers
+  // are always in DRAM or PSRAM; note esp_ptr_executable() is unusable here
+  // since it returns true for PSRAM when SPIRAM is enabled.
+  const struct FftState *fft = &this->frontend_state_.fft;
+  const auto valid_data_ptr = [](const void *p) {
+    return esp_ptr_in_dram(p) || esp_ptr_external_ram(p);
+  };
+  if (!valid_data_ptr(fft->input) || !valid_data_ptr(fft->output) || !valid_data_ptr(fft->scratch)) {
+    ESP_LOGE(TAG, "FFT state corrupted! input=%p output=%p scratch=%p fft_size=%u input_size=%u",
+             fft->input, fft->output, fft->scratch, (unsigned) fft->fft_size, (unsigned) fft->input_size);
+    xEventGroupSetBits(this->event_group_, EventGroupBits::ERROR_INFERENCE);
+    return false;
+  }
   struct FrontendOutput frontend_output =
       FrontendProcessSamples(&this->frontend_state_, audio_buffer, samples_available, processed_samples);
 
