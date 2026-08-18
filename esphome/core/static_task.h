@@ -27,9 +27,10 @@ class StaticTask {
   /// @param param      Parameter passed to task function
   /// @param priority   FreeRTOS task priority
   /// @param use_psram  If true, allocate stack in PSRAM; otherwise internal RAM
+  /// @param core_id    Core affinity (tskNO_AFFINITY by default)
   /// @return true on success
   bool create(TaskFunction_t fn, const char *name, uint32_t stack_size, void *param, UBaseType_t priority,
-              bool use_psram);
+              bool use_psram, BaseType_t core_id = tskNO_AFFINITY);
 
   /// @brief Delete the task but keep the stack buffer allocated for reuse by a subsequent create() call.
   void destroy();
