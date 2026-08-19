@@ -9,12 +9,17 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
+#include <esp_timer.h>
 #include <algorithm>
 #include <cstring>
 
 namespace esphome::resampler {
 
-static const UBaseType_t RESAMPLER_TASK_PRIORITY = 1;
+// Priority 7 keeps the resampler ahead of the mww inference task (6) and the
+// microphone task (5) so announcement audio flows without stalling the mixer
+// (priority 10) when wake word detection runs concurrently. Upstream default
+// of 1 starved the mixer whenever higher-priority audio tasks were busy.
+static const UBaseType_t RESAMPLER_TASK_PRIORITY = 7;
 
 static const uint32_t TRANSFER_BUFFER_DURATION_MS = 50;
 
@@ -361,11 +366,46 @@ void ResamplerSpeaker::resample_task(void *params) {
       xEventGroupSetBits(this_resampler->event_group_, ResamplingEventGroupBits::ERR_ESP_NOT_SUPPORTED);
     }
 
+    // Starvation diagnostics (local to the task): measure how long the input
+    // ring buffer stays empty once the stream has started flowing. Correlate
+    // [rsample] starved lines with [mix]/[spk] lines to find the late stage.
+    bool had_input = false;
+    bool starving = false;
+    int64_t starve_start_us = 0;
+    int64_t last_starve_log_us = 0;
+
     while (err == ESP_OK) {
       uint32_t event_bits = xEventGroupGetBits(this_resampler->event_group_);
 
       if (event_bits & ResamplingEventGroupBits::TASK_COMMAND_STOP) {
         break;
+      }
+
+      {
+        std::shared_ptr<ring_buffer::RingBuffer> input_rb = this_resampler->ring_buffer_.lock();
+        const bool input_empty = !input_rb || input_rb->available() == 0;
+        if (input_empty) {
+          if (had_input) {
+            if (!starving) {
+              starving = true;
+              starve_start_us = esp_timer_get_time();
+            }
+            const int64_t starved_ms = (esp_timer_get_time() - starve_start_us) / 1000;
+            if (starved_ms >= 40 && esp_timer_get_time() - last_starve_log_us > 1000000) {
+              ESP_LOGW(TAG, "[rsample] starved %lld ms (input ring empty)", (long long) starved_ms);
+              last_starve_log_us = esp_timer_get_time();
+            }
+          }
+        } else {
+          if (starving) {
+            starving = false;
+            if (esp_timer_get_time() - starve_start_us > 40000) {
+              ESP_LOGW(TAG, "[rsample] starved %lld ms -> data resumed",
+                       (long long) ((esp_timer_get_time() - starve_start_us) / 1000));
+            }
+          }
+          had_input = true;
+        }
       }
 
       // Stop gracefully if the decoder is done
