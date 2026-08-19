@@ -55,6 +55,23 @@ class CXI2SSpeaker : public speaker::Speaker, public Component {
  protected:
   cx_audio::CXAudio *parent_;
   std::vector<uint8_t> partial_buffer_;
+
+  void summarize_session_();
+
+  // Stutter diagnostics: the I2S0 DMA ring holds ~35 ms of audio at 44.1 kHz
+  // stereo, so any gap between consecutive play() calls longer than the ring
+  // depth means the DAC ran dry and the playback audibly stuttered.
+  // Gaps > 1 s are stream boundaries (mixer idles between announcements with
+  // the DAC muted), not stutters: they start a new session instead.
+  static const uint32_t STUTTER_GAP_MS = 40;
+  static const uint32_t STREAM_BOUNDARY_MS = 1000;
+  int64_t last_play_us_{0};
+  int64_t last_underrun_log_us_{0};
+  int64_t session_start_us_{0};
+  size_t session_bytes_{0};
+  uint32_t underruns_{0};
+  uint32_t max_gap_ms_{0};
+  bool session_summarized_{true};
 };
 
 }  // namespace esphome::cx_i2s

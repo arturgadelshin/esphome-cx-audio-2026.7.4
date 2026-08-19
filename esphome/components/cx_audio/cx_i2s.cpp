@@ -176,24 +176,9 @@ void CXI2SMicrophone::mic_task(void *arg) {
 
   ESP_LOGI(TAG, "Mic task running on core %d", xPortGetCoreID());
 
-  uint32_t bytes_acc = 0;
-  int64_t last_log = esp_timer_get_time();
-
   while (self->task_running_) {
-    bytes_acc += self->read_loop();
+    self->read_loop();
     vTaskDelay(pdMS_TO_TICKS(1));
-    int64_t now = esp_timer_get_time();
-    if (now - last_log >= 1000000) {
-      uint32_t rate = (uint32_t) ((uint64_t) bytes_acc * 1000000 / (uint64_t) (now - last_log));
-      ESP_LOGI(TAG,
-               "[mic_rate] %u bytes/s  (%u%% realtime) | free: internal %u KB (largest %u KB), psram %u KB",
-               rate, rate * 100 / 32000,
-               (unsigned) (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
-               (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
-               (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-      bytes_acc = 0;
-      last_log = now;
-    }
   }
 
   ESP_LOGI(TAG, "Mic task exiting");
@@ -248,28 +233,56 @@ void CXI2SMicrophone::publish_data(const std::vector<uint8_t> &data) { this->dat
 
 void CXI2SSpeaker::setup() {}
 void CXI2SSpeaker::start() { this->state_ = speaker::STATE_RUNNING; }
-void CXI2SSpeaker::stop() { this->state_ = speaker::STATE_STOPPED; }
-void CXI2SSpeaker::loop() {}
-size_t CXI2SSpeaker::play(const uint8_t *data, size_t length) {
-  // One-shot diagnostics: log the stream format and the first bytes that
-  // actually reach I2S0 (debugging HF noise on playback).
-  static bool logged = false;
-  if (!logged) {
-    const auto &info = this->get_audio_stream_info();
-    char hex[49];
-    size_t n = std::min(length, (size_t) 16);
-    for (size_t i = 0; i < n; i++) {
-      snprintf(hex + i * 3, 4, "%02X ", data[i]);
-    }
-    ESP_LOGI(TAG, "[spk] first write: %u bytes, stream %u Hz/%u ch/%u bps, data: %s", (unsigned) length,
-             (unsigned) info.get_sample_rate(), (unsigned) info.get_channels(),
-             (unsigned) info.get_bits_per_sample(), hex);
-    logged = true;
+void CXI2SSpeaker::stop() {
+  this->summarize_session_();
+  this->state_ = speaker::STATE_STOPPED;
+}
+void CXI2SSpeaker::loop() {
+  // The mixer does not call start()/stop() per announcement; it simply stops
+  // writing while no source is playing. Detect the end of a write stream from
+  // loop() so each announcement gets exactly one summary line.
+  if (this->state_ == speaker::STATE_RUNNING && !this->session_summarized_ && this->last_play_us_ != 0 &&
+      esp_timer_get_time() - this->last_play_us_ > STREAM_BOUNDARY_MS * 1000) {
+    this->summarize_session_();
   }
+}
+size_t CXI2SSpeaker::play(const uint8_t *data, size_t length) {
+  const int64_t now_us = esp_timer_get_time();
+  if (this->last_play_us_ != 0) {
+    const uint32_t gap_ms = (uint32_t) ((now_us - this->last_play_us_) / 1000);
+    if (gap_ms >= STREAM_BOUNDARY_MS) {
+      // Stream boundary (silence between announcements, DAC muted): start a
+      // fresh session instead of counting an audible stutter.
+      this->summarize_session_();
+    } else {
+      if (gap_ms > this->max_gap_ms_) {
+        this->max_gap_ms_ = gap_ms;
+      }
+      if (gap_ms >= STUTTER_GAP_MS) {
+        // The DMA ring (~35 ms) drained before new data arrived: audible
+        // stutter. Throttle the event log to at most one line per 500 ms.
+        this->underruns_++;
+        if (now_us - this->last_underrun_log_us_ > 500000) {
+          ESP_LOGW(TAG, "[spk] stutter: %u ms gap between writes (DMA ring ~35 ms)", (unsigned) gap_ms);
+          this->last_underrun_log_us_ = now_us;
+        }
+      }
+    }
+  }
+  if (this->session_summarized_) {
+    this->session_start_us_ = now_us;
+    this->session_bytes_ = 0;
+    this->underruns_ = 0;
+    this->max_gap_ms_ = 0;
+    this->session_summarized_ = false;
+  }
+  this->last_play_us_ = now_us;
+
   size_t written = 0;
   i2s_write(I2S_NUM_0, data, length, &written, pdMS_TO_TICKS(10));
 
   if (written > 0) {
+    this->session_bytes_ += written;
     // Report the frames handed to the DMA/DAC. Downstream components (mixer
     // source speakers, resamplers, media player progress) rely on this
     // callback to account for pending playback frames; without it the
@@ -280,6 +293,15 @@ size_t CXI2SSpeaker::play(const uint8_t *data, size_t length) {
     this->audio_output_callback_(frames, completion_ts);
   }
   return written;
+}
+void CXI2SSpeaker::summarize_session_() {
+  if (this->session_summarized_ || this->session_start_us_ == 0) {
+    return;
+  }
+  const uint32_t dur_ms = (uint32_t) ((this->last_play_us_ - this->session_start_us_) / 1000);
+  ESP_LOGI(TAG, "[spk] session: %u ms, %u bytes, stutters: %u, max gap %u ms", (unsigned) dur_ms,
+           (unsigned) this->session_bytes_, (unsigned) this->underruns_, (unsigned) this->max_gap_ms_);
+  this->session_summarized_ = true;
 }
 bool CXI2SSpeaker::has_buffered_data() const { return false; }
 

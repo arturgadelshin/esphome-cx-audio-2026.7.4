@@ -7,6 +7,8 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
+#include <esp_timer.h>
+
 namespace esphome::speaker {
 
 static const uint32_t INITIAL_BUFFER_MS = 1000;  // Start playback after buffering this duration of the file
@@ -413,11 +415,42 @@ void AudioPipeline::decode_task(void *params) {
 
       size_t initial_bytes_to_buffer = 0;
 
+      // Starvation diagnostics (local to the task): once playback has started,
+      // measure how long the raw file ring buffer stays empty. Correlate
+      // [dec] starved lines with [rsample]/[mix]/[spk] to find the late stage.
+      bool starving = false;
+      int64_t starve_start_us = 0;
+      int64_t last_starve_log_us = 0;
+
       while (true) {
         event_bits = xEventGroupGetBits(this_pipeline->event_group_);
 
         if (event_bits & EventGroupBits::PIPELINE_COMMAND_STOP) {
           break;
+        }
+
+        if (started_playback) {
+          std::shared_ptr<ring_buffer::RingBuffer> raw_rb = this_pipeline->raw_file_ring_buffer_.lock();
+          const bool input_empty = !raw_rb || raw_rb->available() == 0;
+          if (input_empty) {
+            if (!starving) {
+              starving = true;
+              starve_start_us = esp_timer_get_time();
+            }
+            const int64_t starved_ms = (esp_timer_get_time() - starve_start_us) / 1000;
+            if (starved_ms >= 40 && esp_timer_get_time() - last_starve_log_us > 1000000) {
+              ESP_LOGW(TAG, "[dec] starved %lld ms (raw ring empty)", (long long) starved_ms);
+              last_starve_log_us = esp_timer_get_time();
+            }
+          } else {
+            if (starving) {
+              starving = false;
+              if (esp_timer_get_time() - starve_start_us > 40000) {
+                ESP_LOGW(TAG, "[dec] starved %lld ms -> data resumed",
+                         (long long) ((esp_timer_get_time() - starve_start_us) / 1000));
+              }
+            }
+          }
         }
 
         // Update pause state

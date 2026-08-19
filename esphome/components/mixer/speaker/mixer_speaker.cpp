@@ -10,6 +10,7 @@
 #include <mixer.h>        // esp-audio-libs
 #include <pcm_convert.h>  // esp-audio-libs
 
+#include <esp_timer.h>
 #include <algorithm>
 #include <cstring>
 
@@ -471,6 +472,14 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
     bool sent_finished = false;
 
+    // Starvation diagnostics (local to the task): measure how long running
+    // sources provide no data at all. Correlate [mix] starved lines with the
+    // [spk] stutter lines from the output speaker to find the late stage.
+    bool had_data = false;
+    bool starving = false;
+    int64_t starve_start_us = 0;
+    int64_t last_starve_log_us = 0;
+
     // Pre-allocate vectors to avoid heap allocation in the loop (max 8 source speakers per schema)
     FixedVector<SourceSpeaker *> speakers_with_data;
     FixedVector<std::shared_ptr<audio::RingBufferAudioSource>> audio_sources_with_data;
@@ -492,8 +501,10 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       speakers_with_data.clear();
       audio_sources_with_data.clear();
 
+      bool any_source_active = false;
       for (auto &speaker : this_mixer->source_speakers_) {
         if (speaker->is_running() && !speaker->get_pause_state()) {
+          any_source_active = true;
           // Speaker is running and not paused, so it possibly can provide audio data
           std::shared_ptr<audio::RingBufferAudioSource> audio_source = speaker->get_audio_source().lock();
           if (audio_source.use_count() == 0) {
@@ -511,10 +522,29 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       }
 
       if (audio_sources_with_data.empty()) {
+        if (any_source_active && had_data) {
+          // A stream was flowing and now all running sources are dry.
+          if (!starving) {
+            starving = true;
+            starve_start_us = esp_timer_get_time();
+          }
+          const int64_t starved_ms = (esp_timer_get_time() - starve_start_us) / 1000;
+          if (starved_ms >= 40 && esp_timer_get_time() - last_starve_log_us > 1000000) {
+            ESP_LOGW(TAG, "[mix] starved %lld ms (sources running but no data)", (long long) starved_ms);
+            last_starve_log_us = esp_timer_get_time();
+          }
+        }
         // No audio available for transferring, block task temporarily
         delay(TASK_DELAY_MS);
         continue;
       }
+      if (starving) {
+        starving = false;
+        if (had_data && esp_timer_get_time() - starve_start_us > 40000) {
+          ESP_LOGW(TAG, "[mix] starved %lld ms -> data resumed", (long long) ((esp_timer_get_time() - starve_start_us) / 1000));
+        }
+      }
+      had_data = true;
 
       uint32_t frames_to_mix = output_frames_free;
 
