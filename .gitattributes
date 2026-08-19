@@ -4,3 +4,4 @@
 *.gif binary
 *.apng binary
 *.a binary
+*.o binary

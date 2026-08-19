@@ -8,8 +8,12 @@
 #
 # The AVS members define the same framework symbols (va_boot_dsp_signal,
 # va_nvs_* ...) as our stubs in va_patch.cpp and pull in the whole Alexa
-# stack (~2 MB). They are therefore stripped at CMake configure time by
-# extracting only the 7 DSP/IPC members into a separate archive.
+# stack (~2 MB). They are therefore excluded: only the 7 DSP/IPC members
+# are shipped, pre-extracted to lib/sdk_objs. The monolith archive they
+# were taken from (lib/libva_sdk_monolith.a, kept for provenance) has
+# skewed member headers and is rejected as malformed by the GNU ar of
+# binutils 2.43 (esp-14.2.0 toolchain), so configure-time extraction is
+# not possible.
 #
 # The result is linked with --whole-archive: the members reference each
 # other, so no single referenced symbol would pull them all in.
@@ -18,7 +22,7 @@ idf_component_register(
     REQUIRES driver spiffs nvs_flash
 )
 
-set(_sdk_monolith "${CMAKE_CURRENT_LIST_DIR}/../../lib/libva_sdk_monolith.a")
+set(_objs_dir "${CMAKE_CURRENT_LIST_DIR}/../../lib/sdk_objs")
 
 set(_sdk_members
     libva_dsp_va_dsp.o
@@ -30,21 +34,13 @@ set(_sdk_members
     libcnx-ipc_host_depend.o
 )
 
-set(_objs_dir "${CMAKE_CURRENT_BINARY_DIR}/sdk_objs")
 set(_sdk_lib "${CMAKE_CURRENT_BINARY_DIR}/libcx_audio_sdk.a")
 
-file(MAKE_DIRECTORY "${_objs_dir}")
 set(_obj_files "")
 foreach(_member IN LISTS _sdk_members)
     set(_obj "${_objs_dir}/${_member}")
     if(NOT EXISTS "${_obj}")
-        execute_process(
-            COMMAND ${CMAKE_AR} x --output "${_objs_dir}" "${_sdk_monolith}" "${_member}"
-            RESULT_VARIABLE _ar_result
-        )
-        if(NOT _ar_result EQUAL 0)
-            message(FATAL_ERROR "cx_audio_sdk: failed to extract ${_member} from ${_sdk_monolith}")
-        endif()
+        message(FATAL_ERROR "cx_audio_sdk: missing object ${_obj}")
     endif()
     list(APPEND _obj_files "${_obj}")
 endforeach()
