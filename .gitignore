@@ -105,6 +105,9 @@ venv-*/
 !.vscode/tasks.json
 CMakeListsPrivate.txt
 CMakeLists.txt
+# cx_audio ships a precompiled SDK wrapper as an ESP-IDF component; its
+# CMakeLists.txt must be tracked despite the broad rule above.
+!esphome/components/cx_audio/idf/cx_audio_sdk/CMakeLists.txt
 
 # User-specific stuff:
 .idea/**/workspace.xml
