@@ -11,7 +11,12 @@
 
 namespace esphome::speaker {
 
-static const uint32_t INITIAL_BUFFER_MS = 1000;  // Start playback after buffering this duration of the file
+// Start playback after buffering this duration of the file (upstream: 1000).
+// Home Assistant streams TTS audio at roughly realtime pace with delivery
+// pauses; a 1 s runway let those pauses drain the ring buffer and stutter
+// the DAC. 3 s absorbs ~2 s of upstream jitter at the cost of slightly
+// later playback start.
+static const uint32_t INITIAL_BUFFER_MS = 3000;
 
 static const uint32_t READ_TASK_STACK_SIZE = 5 * 1024;
 // Opus decoding uses more stack than other codecs
