@@ -65,9 +65,21 @@ static inline bool is_return_addr(uint32_t addr) {
 // These run from IRAM during panic (no flash access).
 
 #if CONFIG_IDF_TARGET_ARCH_XTENSA
+// Check that an address can be dereferenced as stack memory. Used before the
+// fallback stack scan so a bogus SP cannot fault us again inside the panic
+// handler, where a second fault would cost us the whole report.
+static inline bool IRAM_ATTR is_stack_addr(uint32_t addr) {
+#ifdef SOC_DRAM_LOW
+  return (addr & 0x3) == 0 && addr >= SOC_DRAM_LOW && addr < SOC_DRAM_HIGH;
+#else
+  return (addr & 0x3) == 0 && addr != 0;
+#endif
+}
+
 // Walk Xtensa backtrace from an exception frame, writing PCs to out[].
-// Returns number of entries written.
-static uint8_t IRAM_ATTR walk_xtensa_backtrace(XtExcFrame *frame, uint32_t *out, uint8_t max) {
+// Returns total number of entries written; *reg_count receives the number taken
+// from the frame walk (the rest come from the stack scan below).
+static uint8_t IRAM_ATTR walk_xtensa_backtrace(XtExcFrame *frame, uint32_t *out, uint8_t max, uint8_t *reg_count) {
   esp_backtrace_frame_t bt_frame = {
       .pc = (uint32_t) frame->pc,
       .sp = (uint32_t) frame->a1,
@@ -76,8 +88,14 @@ static uint8_t IRAM_ATTR walk_xtensa_backtrace(XtExcFrame *frame, uint32_t *out,
   };
   uint8_t count = 0;
   uint32_t first_pc = esp_cpu_process_stack_pc(bt_frame.pc);
+  uint32_t ret_pc = esp_cpu_process_stack_pc(bt_frame.next_pc);
   if (is_code_addr(first_pc)) {
     out[count++] = first_pc;
+  } else if (is_code_addr(ret_pc)) {
+    // A jump through a NULL (or otherwise non-code) function pointer: the
+    // faulting PC names nothing, but a0 still holds the return address of
+    // whoever made the call. Without it the report is just "PC: 0x00000000".
+    out[count++] = ret_pc;
   }
   while (count < max && bt_frame.next_pc != 0) {
     if (!esp_backtrace_get_next_frame(&bt_frame))
@@ -85,6 +103,21 @@ static uint8_t IRAM_ATTR walk_xtensa_backtrace(XtExcFrame *frame, uint32_t *out,
     uint32_t pc = esp_cpu_process_stack_pc(bt_frame.pc);
     if (is_code_addr(pc)) {
       out[count++] = pc;
+    }
+  }
+  *reg_count = count;
+
+  // A walk seeded from a bogus PC usually stops immediately, leaving one entry
+  // or none. Fall back to a bounded stack scan so there is still a chain to
+  // decode, the same approach capture_riscv_backtrace() already uses.
+  if (count <= 1 && is_stack_addr((uint32_t) frame->a1)) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr) - walking the raw stack by address is the point
+    auto *scan_start = (uint32_t *) frame->a1;
+    for (uint32_t i = 0; i < 64 && count < max; i++) {
+      uint32_t val = esp_cpu_process_stack_pc(scan_start[i]);
+      if (is_code_addr(val) && val != first_pc && val != ret_pc) {
+        out[count++] = val;
+      }
     }
   }
   return count;
@@ -298,10 +331,8 @@ static void log_backtrace(const uint32_t *addrs, uint8_t count, uint8_t reg_fram
 #if CONFIG_IDF_TARGET_ARCH_RISCV
     if (i >= reg_frame_count && !is_return_addr(addr))
       continue;
-    const char *source = (i < reg_frame_count) ? "backtrace" : "stack scan";
-#else
-    const char *source = "backtrace";
 #endif
+    const char *source = (i < reg_frame_count) ? "backtrace" : "stack scan";
     ESP_LOGE(TAG, "  BT%d: 0x%08" PRIX32 "  (%s)", bt_num++, addr, source);
   }
 }
@@ -392,7 +423,8 @@ void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info) {
   if (info->frame != nullptr) {
     auto *xt_frame = (XtExcFrame *) info->frame;
     s_raw_crash_data.cause = xt_frame->exccause;
-    s_raw_crash_data.backtrace_count = walk_xtensa_backtrace(xt_frame, s_raw_crash_data.backtrace, MAX_BACKTRACE);
+    s_raw_crash_data.backtrace_count =
+        walk_xtensa_backtrace(xt_frame, s_raw_crash_data.backtrace, MAX_BACKTRACE, &s_raw_crash_data.reg_frame_count);
   }
 
 #if SOC_CPU_CORES_NUM > 1
@@ -403,8 +435,8 @@ void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info) {
     int other_core = 1 - info->core;
     auto *other_frame = (XtExcFrame *) g_exc_frames[other_core];
     if (other_frame != nullptr) {
-      s_raw_crash_data.other_backtrace_count =
-          walk_xtensa_backtrace(other_frame, s_raw_crash_data.other_backtrace, MAX_BACKTRACE);
+      s_raw_crash_data.other_backtrace_count = walk_xtensa_backtrace(
+          other_frame, s_raw_crash_data.other_backtrace, MAX_BACKTRACE, &s_raw_crash_data.other_reg_frame_count);
     }
   }
 #endif
