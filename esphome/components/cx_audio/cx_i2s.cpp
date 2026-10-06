@@ -25,6 +25,26 @@ static const char *const TAG = "cx_i2s";
 
 extern "C" void esphome_set_dsp_fw_mode(int mode);
 
+// The SDK calls these back through stored pointers with no NULL check (three
+// sites in va_dsp_thread). All of those branches are currently unreachable, but
+// va_dsp.h requires callbacks, so keep stubs instead of passing nullptr.
+extern "C" {
+// 0 means "activation declined": on a non-zero answer the SDK calls
+// cnx20921_start_speech and begins its own capture, racing mic_task, which
+// reads I2S directly. The audio path has to stay with the fork.
+static int cx_dsp_recognize_stub(int ww_length, enum initiator init_type) {
+  (void) ww_length;
+  (void) init_type;
+  return 0;
+}
+static int cx_dsp_record_stub(void *data, int len) {
+  (void) data;
+  (void) len;
+  return 0;
+}
+static void cx_dsp_mute_notify_stub(bool mute) { (void) mute; }
+}
+
 void CXI2SMicrophone::setup() {
   ESP_LOGI(TAG, "Setting up CX I2S Microphone...");
 
@@ -48,7 +68,7 @@ void CXI2SMicrophone::setup() {
   vTaskDelay(pdMS_TO_TICKS(500));
 
   ESP_LOGI(TAG, "Calling va_dsp_init...");
-  va_dsp_init(nullptr, nullptr, nullptr);
+  va_dsp_init(cx_dsp_recognize_stub, cx_dsp_record_stub, cx_dsp_mute_notify_stub);
   ESP_LOGI(TAG, "va_dsp_init returned");
 
   if (this->mic_gain_ != 0.0f) {
