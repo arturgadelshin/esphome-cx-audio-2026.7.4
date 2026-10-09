@@ -223,14 +223,13 @@ void CXI2SMicrophone::mic_task(void *arg) {
 }
 
 size_t CXI2SMicrophone::read_loop() {
-  if (this->simulate_stall_) {
-    return 0;
-  }
-
   uint8_t stereo_buffer[640];
   size_t bytes_read = 0;
+  esp_err_t err = ESP_OK;
 
-  esp_err_t err = i2s_read(I2S_NUM_1, stereo_buffer, sizeof(stereo_buffer), &bytes_read, pdMS_TO_TICKS(10));
+  if (!this->simulate_stall_) {
+    err = i2s_read(I2S_NUM_1, stereo_buffer, sizeof(stereo_buffer), &bytes_read, pdMS_TO_TICKS(10));
+  }
 
   if (err != ESP_OK || bytes_read == 0) {
     const uint32_t now_ms = millis();
