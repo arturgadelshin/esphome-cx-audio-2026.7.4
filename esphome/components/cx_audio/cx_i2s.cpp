@@ -243,6 +243,7 @@ size_t CXI2SMicrophone::read_loop() {
       if (this->stall_recoveries_ > MIC_STALL_MAX_RECOVERIES) {
         ESP_LOGE(TAG, "Mic stalled for %u ms after %u recovery attempts, rebooting",
                  (unsigned) (now_ms - this->stall_since_ms_), (unsigned) MIC_STALL_MAX_RECOVERIES);
+        vTaskDelay(pdMS_TO_TICKS(250));
         esp_restart();
       }
       ESP_LOGE(TAG, "Mic data stalled for %u ms (err=%d), recovering DSP %u/%u",
