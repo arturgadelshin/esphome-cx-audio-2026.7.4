@@ -19,6 +19,7 @@ class CXI2SMicrophone : public microphone::Microphone, public Component {
   void loop() override {}
   void set_cx_audio(cx_audio::CXAudio *parent) { this->parent_ = parent; }
   bool is_running() const { return this->state_ == microphone::STATE_RUNNING; }
+  void set_simulate_stall(bool simulate) { this->simulate_stall_ = simulate; }
   void publish_data(const std::vector<uint8_t> &data);
   bool set_mic_gain(float mic_gain);
   float get_mic_gain_value() const { return mic_gain_; }
@@ -40,6 +41,15 @@ class CXI2SMicrophone : public microphone::Microphone, public Component {
   static void mic_task(void *arg);
   size_t read_loop();
   void flush_buffers();
+  void recover_dsp_();
+
+  static const uint32_t MIC_STALL_TIMEOUT_MS = 2000;
+  static const uint32_t MIC_STALL_MAX_RECOVERIES = 3;
+
+  volatile bool simulate_stall_{false};
+  bool stall_active_{false};
+  uint32_t stall_since_ms_{0};
+  uint32_t stall_recoveries_{0};
 };
 
 class CXI2SSpeaker : public speaker::Speaker, public Component {

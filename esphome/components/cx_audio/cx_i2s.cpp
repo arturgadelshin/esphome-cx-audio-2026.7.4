@@ -12,6 +12,7 @@
 #include <freertos/task.h>
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
+#include <esp_system.h>
 
 extern "C" {
 #include <va_dsp.h>
@@ -54,6 +55,13 @@ void CXI2SMicrophone::setup() {
 
   esphome_set_dsp_fw_mode(fw_mode);
 
+  this->recover_dsp_();
+
+  this->stop_semaphore_ = xSemaphoreCreateBinary();
+  this->ref_mutex_ = xSemaphoreCreateMutex();
+}
+
+void CXI2SMicrophone::recover_dsp_() {
   ESP_LOGI(TAG, "Performing hardware reset on GPIO21...");
   gpio_num_t reset_pin = GPIO_NUM_21;
   gpio_config_t io_conf = {.pin_bit_mask = (1ULL << reset_pin),
@@ -74,9 +82,6 @@ void CXI2SMicrophone::setup() {
   if (this->mic_gain_ != 0.0f) {
     cx20921SetMicGain((int) this->mic_gain_);
   }
-
-  this->stop_semaphore_ = xSemaphoreCreateBinary();
-  this->ref_mutex_ = xSemaphoreCreateMutex();
 }
 
 void CXI2SMicrophone::start() {
@@ -113,6 +118,9 @@ void CXI2SMicrophone::start() {
 
   this->task_running_ = true;
   this->state_ = microphone::STATE_RUNNING;
+  this->stall_active_ = false;
+  this->stall_since_ms_ = 0;
+  this->stall_recoveries_ = 0;
 
   this->mic_task_handle_ = xTaskCreateStaticPinnedToCore(mic_task, "cx_mic_task", mic_stack_depth, this, 5,
                                                          this->mic_stack_, &this->mic_tcb_, 1);
@@ -215,14 +223,42 @@ void CXI2SMicrophone::mic_task(void *arg) {
 }
 
 size_t CXI2SMicrophone::read_loop() {
+  if (this->simulate_stall_) {
+    return 0;
+  }
+
   uint8_t stereo_buffer[640];
   size_t bytes_read = 0;
 
   esp_err_t err = i2s_read(I2S_NUM_1, stereo_buffer, sizeof(stereo_buffer), &bytes_read, pdMS_TO_TICKS(10));
 
   if (err != ESP_OK || bytes_read == 0) {
+    const uint32_t now_ms = millis();
+    if (!this->stall_active_) {
+      this->stall_active_ = true;
+      this->stall_since_ms_ = now_ms;
+      return 0;
+    }
+    if (now_ms - this->stall_since_ms_ >= MIC_STALL_TIMEOUT_MS) {
+      this->stall_recoveries_++;
+      if (this->stall_recoveries_ > MIC_STALL_MAX_RECOVERIES) {
+        ESP_LOGE(TAG, "Mic stalled for %u ms after %u recovery attempts, rebooting",
+                 (unsigned) (now_ms - this->stall_since_ms_), (unsigned) MIC_STALL_MAX_RECOVERIES);
+        esp_restart();
+      }
+      ESP_LOGE(TAG, "Mic data stalled for %u ms (err=%d), recovering DSP %u/%u",
+               (unsigned) (now_ms - this->stall_since_ms_), (int) err,
+               (unsigned) this->stall_recoveries_, (unsigned) MIC_STALL_MAX_RECOVERIES);
+      this->stall_since_ms_ = now_ms;
+      this->recover_dsp_();
+      this->flush_buffers();
+    }
     return 0;
   }
+
+  this->stall_active_ = false;
+  this->stall_since_ms_ = 0;
+  this->stall_recoveries_ = 0;
 
   size_t samples = bytes_read / 4;
   // Reuse the member buffer across calls: allocating a fresh vector every
